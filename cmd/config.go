@@ -24,6 +24,14 @@ type Config struct {
 
 var config Config
 
+// InitConfig sets up the configuration store so that the option accessors
+// (GetOptionValue, SetOptionValue, IsOptionEnabled) can be used. It is called
+// by Init, and is exported so that tests can exercise code paths that read
+// options without booting the whole application.
+func InitConfig() {
+	config.setup()
+}
+
 // Init sets up the configuration.
 func (c *Config) setup() {
 	var homedirExist bool

@@ -32,10 +32,11 @@ func SetupUI() {
 	app.ShowInfo(msg, true)
 	go detectPlayerClose()
 
+	player.Start()
+
 	player.ParseQuery()
 	view.Search.ParseQuery()
 
-	player.Start()
 	view.SetView(&view.Banner)
 
 	_, focusedItem := app.UI.Pages.GetFrontPage()

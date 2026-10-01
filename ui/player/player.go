@@ -6,6 +6,7 @@ import (
 	"image/jpeg"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,7 +30,7 @@ type Player struct {
 	seeker  CustomSeeker
 
 	infoID, thumbURI string
-	init             bool
+	init, started    bool
 	width            int
 	history          History
 	states           []string
@@ -112,6 +113,11 @@ func setup() {
 // Start starts the player and loads its history and states.
 func Start() {
 	setup()
+	if player.started {
+		return
+	}
+	player.started = true
+
 	player.queue.Setup()
 	player.fetcher.Setup()
 	player.seeker.Setup()
@@ -547,14 +553,72 @@ func renderPlayer() {
 	player.mutex.Unlock()
 }
 
+// thumbnail returns the URI of the thumbnail that is currently selected.
+func thumbnail() string {
+	player.mutex.Lock()
+	defer player.mutex.Unlock()
+
+	return player.thumbURI
+}
+
+// setThumbnail sets the URI of the thumbnail to display.
+func setThumbnail(uri string) {
+	player.mutex.Lock()
+	defer player.mutex.Unlock()
+
+	player.thumbURI = uri
+}
+
+// displayThumbnails returns the video's display thumbnails. The "start",
+// "middle" and "end" qualities are storyboard frames sampled from the video
+// itself, which are always tiny, so they are discarded.
+func displayThumbnails(video inv.VideoData) []inv.VideoThumbnails {
+	thumbs := make([]inv.VideoThumbnails, 0, len(video.Thumbnails))
+	for _, thumb := range video.Thumbnails {
+		switch thumb.Quality {
+		case "start", "middle", "end":
+			continue
+		}
+
+		thumbs = append(thumbs, thumb)
+	}
+	if len(thumbs) == 0 {
+		return video.Thumbnails
+	}
+
+	return thumbs
+}
+
+// selectThumbnail returns the position of the thumbnail to display. If the
+// currently selected thumbnail does not belong to the provided list, the one
+// with the highest resolution is chosen. The API orders the thumbnails in
+// descending resolution, but the resolutions are compared explicitly so that
+// a differently ordered response still ends up selecting the largest image.
+func selectThumbnail(thumbs []inv.VideoThumbnails) int {
+	uri := thumbnail()
+
+	pos := -1
+	for i, thumb := range thumbs {
+		if thumb.URL == uri {
+			return i
+		}
+	}
+
+	pos = 0
+	for i, thumb := range thumbs {
+		if thumb.Width*thumb.Height > thumbs[pos].Width*thumbs[pos].Height {
+			pos = i
+		}
+	}
+
+	return pos
+}
+
 // changeImageQuality sets or displays options to change the quality of the image
 // in the player information area.
 //
 //gocyclo:ignore
 func changeImageQuality(set ...struct{}) {
-	var prev string
-	var options []string
-
 	data, ok := player.queue.GetCurrent()
 	if !ok {
 		return
@@ -562,39 +626,43 @@ func changeImageQuality(set ...struct{}) {
 
 	video := data.Reference
 
-	start, pos := -1, -1
-	for i, thumb := range video.Thumbnails {
-		if thumb.Quality == "start" {
-			start = i
-			break
-		}
-
-		if thumb.URL == player.thumbURI {
-			pos = i
-		}
-
-		if set == nil {
-			text := fmt.Sprintf("%dx%d", thumb.Width, thumb.Height)
-			if prev == text {
-				continue
-			}
-
-			prev = text
-			options = append(options, text)
-		}
+	thumbs := displayThumbnails(video)
+	if len(thumbs) == 0 {
+		return
 	}
-	if start >= 0 && (pos < 0 || player.thumbURI == "") {
-		pos = len(options) - 1
-		player.thumbURI = video.Thumbnails[start-1].URL
+
+	pos := selectThumbnail(thumbs)
+	if thumbs[pos].URL != thumbnail() {
+		setThumbnail(thumbs[pos].URL)
 	}
+
 	if set != nil || !player.toggle.Load() || player.quality.HasFocus() {
 		return
 	}
 
-	thumb := video.Thumbnails[pos]
-	for i, option := range options {
-		if option == fmt.Sprintf("%dx%d", thumb.Width, thumb.Height) {
-			pos = i
+	// Build the dropdown list. Several entries usually share the same
+	// resolution, so they are collapsed into a single option, and the thumbnail
+	// position each option maps to is kept alongside it.
+	var (
+		prev    string
+		options []string
+		indexes []int
+	)
+	for i, thumb := range thumbs {
+		text := fmt.Sprintf("%dx%d", thumb.Width, thumb.Height)
+		if text == prev {
+			continue
+		}
+
+		prev = text
+		options = append(options, text)
+		indexes = append(indexes, i)
+	}
+
+	option := -1
+	for i, opt := range options {
+		if opt == fmt.Sprintf("%dx%d", thumbs[pos].Width, thumbs[pos].Height) {
+			option = i
 			break
 		}
 	}
@@ -629,23 +697,16 @@ func changeImageQuality(set ...struct{}) {
 	)
 
 	player.quality.SetOptions(options, func(text string, index int) {
-		if index < 0 {
+		if index < 0 || index >= len(indexes) {
 			return
 		}
 
-		for i, thumb := range video.Thumbnails {
-			if text == fmt.Sprintf("%dx%d", thumb.Width, thumb.Height) {
-				index = i
-				break
-			}
-		}
-
-		if uri := video.Thumbnails[index].URL; uri != player.thumbURI {
-			player.thumbURI = uri
-			go renderInfoImage(infoContext(true), infoID(), filepath.Base(uri), struct{}{})
+		if uri := thumbs[indexes[index]].URL; uri != thumbnail() {
+			setThumbnail(uri)
+			go renderInfoImage(infoContext(true), uri, struct{}{})
 		}
 	})
-	player.quality.SetCurrentOption(pos)
+	player.quality.SetCurrentOption(option)
 	player.quality.InputHandler()(
 		keybinding.KeyEvent(keybinding.KeySelect),
 		func(p tview.Primitive) {
@@ -700,6 +761,17 @@ func renderInfo(video inv.VideoData, force ...struct{}) {
 		return
 	}
 
+	// The thumbnail is selected here rather than in the queued closure below,
+	// as the image is requested right away and the closure only runs once the
+	// UI event loop picks it up.
+	thumbs := displayThumbnails(video)
+	if len(thumbs) != 0 {
+		pos := selectThumbnail(thumbs)
+		if thumbs[pos].URL != thumbnail() {
+			setThumbnail(thumbs[pos].URL)
+		}
+	}
+
 	app.ConditionalDraw(func() bool {
 		infoID(video.VideoID)
 		if player.region.GetItemCount() > 2 {
@@ -731,18 +803,18 @@ func renderInfo(video inv.VideoData, force ...struct{}) {
 		return IsInfoShown()
 	})
 
-	go renderInfoImage(infoContext(true), video.VideoID, filepath.Base(player.thumbURI))
+	go renderInfoImage(infoContext(true), thumbnail())
 }
 
 // renderInfoImage renders the image for the track information display.
-func renderInfoImage(ctx context.Context, id, image string, change ...struct{}) {
-	if image == "." {
+func renderInfoImage(ctx context.Context, uri string, change ...struct{}) {
+	if uri == "" || uri == "." {
 		return
 	}
 
 	app.ShowInfo("Player: Loading image", true, change != nil)
 
-	thumbdata, err := inv.VideoThumbnail(ctx, id, image)
+	thumbdata, err := inv.VideoThumbnail(ctx, uri)
 	if err != nil {
 		if ctx.Err() != context.Canceled {
 			app.ShowError(fmt.Errorf("Player: Unable to download thumbnail"))
@@ -752,10 +824,24 @@ func renderInfoImage(ctx context.Context, id, image string, change ...struct{}) 
 
 		return
 	}
+	defer thumbdata.Body.Close()
+
+	// Instances that have thumbnails disabled, or that sit behind a bot check,
+	// reply with an HTML page and a 200 status code. Detecting that here keeps
+	// the misleading "unable to decode" message from being shown.
+	if ctype := thumbdata.Header.Get("Content-Type"); ctype != "" &&
+		!strings.HasPrefix(ctype, "image/") {
+		app.ShowInfo("", false, change != nil)
+		app.ShowInfo("Player: Thumbnails are not served by this instance", false, change != nil)
+
+		return
+	}
 
 	thumbnail, err := jpeg.Decode(thumbdata.Body)
 	if err != nil {
+		app.ShowInfo("", false, change != nil)
 		app.ShowError(fmt.Errorf("Player: Unable to decode thumbnail"))
+
 		return
 	}
 

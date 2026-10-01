@@ -70,9 +70,16 @@ func Video(id string, ctx ...context.Context) (VideoData, error) {
 	return getVideo(ctx[0], id)
 }
 
-// VideoThumbnail returns data to parse a video thumbnail.
-func VideoThumbnail(ctx context.Context, id, image string) (*http.Response, error) {
-	res, err := client.Get(ctx, fmt.Sprintf("/vi/%s/%s", id, image))
+// VideoThumbnail returns the response of a video thumbnail request.
+// The provided uri is the thumbnail's URL as returned by the API. Only its
+// path and query are used, as the request is served by the instance itself.
+func VideoThumbnail(ctx context.Context, uri string) (*http.Response, error) {
+	url, err := utils.IsValidURL(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := client.Get(ctx, url.RequestURI())
 	if err != nil {
 		return nil, err
 	}
