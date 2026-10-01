@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -89,8 +90,16 @@ func VideoThumbnail(ctx context.Context, uri string) (*http.Response, error) {
 
 // RenewVideoURI renews the video's media URIs.
 func RenewVideoURI(ctx context.Context, uri [2]string, video VideoData, audio bool) (VideoData, [2]string, error) {
-	if uri[0] != "" && video.LiveNow {
-		if _, renew := CheckLiveURL(uri[0], audio); !renew {
+	if uri[0] != "" {
+		switch {
+		case video.LiveNow:
+			if _, renew := CheckLiveURL(uri[0], audio); !renew {
+				return video, uri, nil
+			}
+
+		case !mediaURLExpired(uri[0]):
+			// A resolved media URL stays valid until it expires, so there
+			// is no need to query the API again for it.
 			return video, uri, nil
 		}
 	}
@@ -101,6 +110,28 @@ func RenewVideoURI(ctx context.Context, uri [2]string, video VideoData, audio bo
 	}
 
 	return v, uris, nil
+}
+
+// mediaURLExpired reports whether a resolved media URL has expired.
+// videoplayback URLs carry an "expire" unix timestamp in their query string;
+// URLs without one are treated as valid.
+func mediaURLExpired(uri string) bool {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return true
+	}
+
+	expire := parsed.Query().Get("expire")
+	if expire == "" {
+		return false
+	}
+
+	timestamp, err := strconv.ParseInt(expire, 10, 64)
+	if err != nil {
+		return true
+	}
+
+	return time.Now().Unix() >= timestamp
 }
 
 // CheckLiveURL returns whether the provided live video's URL has expired or not.
@@ -168,7 +199,13 @@ func getVideoURI(ctx context.Context, video VideoData, audio bool) (VideoData, [
 		audio = false
 		videoURL, audioURL = getLiveVideo(ctx, video.VideoID, audio)
 	} else {
-		videoURL, audioURL = getVideoByItag(video, audio)
+		videoURL, audioURL = getVideoByFormat(video, audio)
+
+		// Instances that have lost access to YouTube omit the format URLs
+		// altogether, so the format has to be resolved by the instance itself.
+		if (audio && audioURL == "") || (!audio && videoURL == "") {
+			videoURL, audioURL = getVideoByItag(video, audio)
+		}
 	}
 
 	if audio && audioURL == "" {
@@ -256,6 +293,173 @@ func matchVideoResolution(video VideoData, urlType string) string {
 	}
 
 	return uri
+}
+
+// formatKind splits a format's MIME type into its kind ("video"/"audio") and
+// container ("mp4"/"webm"). Invidious emits types such as
+// `video/mp4; codecs="avc1.640028"`, and audio entries omit the codec part
+// entirely in some responses.
+func formatKind(format VideoFormat) (kind, container string) {
+	main := strings.TrimSpace(strings.Split(format.Type, ";")[0])
+
+	parts := strings.SplitN(main, "/", 2)
+	if len(parts) != 2 {
+		return "", ""
+	}
+
+	return parts[0], parts[1]
+}
+
+// resolutionHeight returns the vertical resolution of the format in pixels,
+// or 0 when the format does not carry one (audio entries, for instance).
+func resolutionHeight(format VideoFormat) int {
+	res := strings.TrimSuffix(format.Resolution, "p")
+	if res == "" || res == format.Resolution {
+		// Not a "<n>p" value, e.g. "audio_only" or an empty resolution.
+		return 0
+	}
+
+	height, err := strconv.Atoi(res)
+	if err != nil {
+		return 0
+	}
+
+	return height
+}
+
+// formatScore ranks a format against the requested resolution and container.
+// A lower score is better, and the fields are compared in order.
+type formatScore struct {
+	class     int
+	container int
+	distance  int
+}
+
+// rankFormat scores a single format. Formats are grouped so that an exact
+// resolution match always wins, then anything below the request (closest
+// first), and only then anything above it. mp4 is preferred over webm within
+// the same group, as it plays back most reliably.
+func rankFormat(format VideoFormat, wantHeight int) formatScore {
+	_, container := formatKind(format)
+
+	score := formatScore{}
+	if container == "mp4" {
+		score.container = 1
+	}
+
+	height := resolutionHeight(format)
+	if wantHeight <= 0 || height <= 0 {
+		// Either no resolution was requested or this format carries none,
+		// so only the container matters.
+		return score
+	}
+
+	switch {
+	case height == wantHeight:
+		score.class = 0
+	case height < wantHeight:
+		score.class = 1
+		score.distance = wantHeight - height
+	default:
+		score.class = 2
+		score.distance = height - wantHeight
+	}
+
+	return score
+}
+
+// betterFormat reports whether a scores strictly better than b.
+func betterFormat(a, b formatScore) bool {
+	if a.class != b.class {
+		return a.class < b.class
+	}
+	if a.container != b.container {
+		return a.container > b.container
+	}
+
+	return a.distance < b.distance
+}
+
+// pickFormat returns the format that best satisfies the requested kind,
+// preferring mp4 over webm and, for videos, the configured resolution with a
+// graceful fallback to whatever the instance does offer.
+func pickFormat(formats []VideoFormat, kind string, wantHeight int) *VideoFormat {
+	var (
+		best  *VideoFormat
+		score formatScore
+		found bool
+	)
+
+	for i, format := range formats {
+		if format.URL == "" {
+			continue
+		}
+
+		if fkind, _ := formatKind(format); fkind != kind {
+			continue
+		}
+
+		current := rankFormat(format, wantHeight)
+		if !found || betterFormat(current, score) {
+			best, score, found = &formats[i], current, true
+		}
+	}
+
+	return best
+}
+
+// getVideoByFormat resolves the media URLs from the formats the API already
+// returned, rather than asking the instance to resolve an itag. Both the
+// muxed FormatStreams and the split AdaptiveFormats are considered.
+func getVideoByFormat(video VideoData, audio bool) (string, string) {
+	wantHeight := 0
+	if res := cmd.GetOptionValue("video-res"); res != "" {
+		if height, err := strconv.Atoi(strings.TrimSuffix(res, "p")); err == nil {
+			wantHeight = height
+		}
+	}
+
+	audioFormat := pickFormat(video.AdaptiveFormats, "audio", 0)
+
+	if audio {
+		if audioFormat == nil {
+			return "", ""
+		}
+
+		return "", audioFormat.URL
+	}
+
+	// A muxed format carries audio and video in a single stream, so mpv needs
+	// no external audio track. It is preferred, but only when it resolves to
+	// at least the same resolution as the split formats would.
+	muxed := pickFormat(video.FormatStreams, "video", wantHeight)
+	videoFormat := pickFormat(video.AdaptiveFormats, "video", wantHeight)
+
+	switch {
+	case muxed == nil && videoFormat == nil:
+		return "", ""
+
+	case videoFormat == nil:
+		return muxed.URL, ""
+
+	case muxed == nil:
+		// Without a separate audio track a video-only stream would be silent.
+		if audioFormat == nil {
+			return "", ""
+		}
+
+		return videoFormat.URL, audioFormat.URL
+	}
+
+	// Only trade the single-stream convenience for the split formats when they
+	// land in a strictly better resolution group, so that an exact match wins
+	// over a muxed format that is merely close.
+	if rankFormat(*videoFormat, wantHeight).class < rankFormat(*muxed, wantHeight).class &&
+		audioFormat != nil {
+		return videoFormat.URL, audioFormat.URL
+	}
+
+	return muxed.URL, ""
 }
 
 // getVideoByItag gets the appropriate itag of the video format, and

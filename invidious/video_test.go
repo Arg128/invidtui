@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/darkhz/invidtui/client"
 	"github.com/darkhz/invidtui/cmd"
@@ -483,6 +485,234 @@ func TestGetVideo_NullFormatStreams(t *testing.T) {
 // Format selection: the code that actually consumes the decoded JSON
 // ---------------------------------------------------------------------------
 
+// getVideoByFormat resolves the media URLs locally, out of the format lists
+// the API already returned, instead of asking the instance to resolve an itag.
+// Both the muxed formatStreams and the split adaptiveFormats must be handled.
+func TestGetVideoByFormat_ResolvesLocally(t *testing.T) {
+	initTestConfig(t)
+
+	newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, videoPayload)
+	})
+
+	video, err := getVideo(client.Ctx(), "YQHsXMglC9A")
+	if err != nil {
+		t.Fatalf("getVideo: %v", err)
+	}
+
+	t.Run("video prefers a muxed format at the configured resolution", func(t *testing.T) {
+		cmd.SetOptionValue("video-res", "720p")
+
+		videoURL, audioURL := getVideoByFormat(video, false)
+		if videoURL != "https://example.com/videoplayback?expire=1&itag=22&clen=23456789" {
+			t.Errorf("videoURL = %q, want the itag 22 formatStream", videoURL)
+		}
+		if audioURL != "" {
+			t.Errorf("audioURL = %q, want empty for a muxed format", audioURL)
+		}
+	})
+
+	t.Run("video splits the tracks when no muxed format matches", func(t *testing.T) {
+		cmd.SetOptionValue("video-res", "1080p")
+
+		videoURL, audioURL := getVideoByFormat(video, false)
+		if videoURL != "https://example.com/videoplayback?expire=1&itag=137" {
+			t.Errorf("videoURL = %q, want the itag 137 adaptive format", videoURL)
+		}
+		if audioURL != "https://example.com/videoplayback?expire=1&itag=140" {
+			t.Errorf("audioURL = %q, want the mp4 (itag 140) audio format", audioURL)
+		}
+	})
+
+	t.Run("audio returns only an audio track", func(t *testing.T) {
+		cmd.SetOptionValue("video-res", "720p")
+
+		videoURL, audioURL := getVideoByFormat(video, true)
+		if videoURL != "" {
+			t.Errorf("videoURL = %q, want empty in audio mode", videoURL)
+		}
+		if audioURL != "https://example.com/videoplayback?expire=1&itag=140" {
+			t.Errorf("audioURL = %q, want the mp4 (itag 140) audio format", audioURL)
+		}
+	})
+
+	t.Run("never resolves through the instance", func(t *testing.T) {
+		cmd.SetOptionValue("video-res", "720p")
+
+		for _, audio := range []bool{false, true} {
+			videoURL, audioURL := getVideoByFormat(video, audio)
+			for _, uri := range []string{videoURL, audioURL} {
+				if strings.Contains(uri, "/latest_version") {
+					t.Errorf("audio=%v: uri = %q, want no /latest_version URL", audio, uri)
+				}
+			}
+		}
+	})
+}
+
+// An unavailable resolution must fall back to the closest one below it rather
+// than returning nothing, and mp4 must win over webm at equal merit.
+func TestPickFormat_FallsBackBelowRequestedResolution(t *testing.T) {
+	initTestConfig(t)
+
+	newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, videoPayload)
+	})
+
+	video, err := getVideo(client.Ctx(), "YQHsXMglC9A")
+	if err != nil {
+		t.Fatalf("getVideo: %v", err)
+	}
+
+	t.Run("falls back to the highest resolution below the request", func(t *testing.T) {
+		cmd.SetOptionValue("video-res", "4320p")
+
+		videoURL, _ := getVideoByFormat(video, false)
+		if videoURL != "https://example.com/videoplayback?expire=1&itag=22&clen=23456789" {
+			t.Errorf("videoURL = %q, want the 720p itag 22 formatStream", videoURL)
+		}
+	})
+
+	t.Run("mp4 is preferred over webm", func(t *testing.T) {
+		formats := []VideoFormat{
+			{URL: "webm-video", Type: `video/webm; codecs="vp9"`, Resolution: "720p"},
+			{URL: "mp4-video", Type: `video/mp4; codecs="avc1.4d401f"`, Resolution: "720p"},
+		}
+
+		format := pickFormat(formats, "video", 720)
+		if format == nil {
+			t.Fatal("pickFormat returned nil")
+		}
+		if format.URL != "mp4-video" {
+			t.Errorf("URL = %q, want mp4-video", format.URL)
+		}
+	})
+
+	t.Run("formats without a URL are skipped", func(t *testing.T) {
+		formats := []VideoFormat{
+			{URL: "", Type: `video/mp4; codecs="avc1.4d401f"`, Resolution: "720p"},
+			{URL: "fallback", Type: `video/mp4; codecs="avc1.4d401e"`, Resolution: "480p"},
+		}
+
+		format := pickFormat(formats, "video", 720)
+		if format == nil {
+			t.Fatal("pickFormat returned nil")
+		}
+		if format.URL != "fallback" {
+			t.Errorf("URL = %q, want fallback", format.URL)
+		}
+	})
+
+	t.Run("audio entries are not returned for a video request", func(t *testing.T) {
+		formats := []VideoFormat{
+			{URL: "audio-only", Type: `audio/mp4; codecs="mp4a.40.2"`},
+		}
+
+		if format := pickFormat(formats, "video", 720); format != nil {
+			t.Errorf("pickFormat returned %q for a video request", format.URL)
+		}
+	})
+}
+
+// A video whose only formats are video-only streams has no audio track to
+// attach, so playback must not be attempted with a silent video.
+func TestGetVideoByFormat_NoAudioTrackForSplitVideo(t *testing.T) {
+	initTestConfig(t)
+
+	newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, videoPayload)
+	})
+
+	video, err := getVideo(client.Ctx(), "YQHsXMglC9A")
+	if err != nil {
+		t.Fatalf("getVideo: %v", err)
+	}
+
+	videoOnly := video
+	videoOnly.FormatStreams = nil
+	videoOnly.AdaptiveFormats = []VideoFormat{
+		{
+			URL:        "https://example.com/videoplayback?expire=1&itag=137",
+			Itag:       "137",
+			Type:       `video/mp4; codecs="avc1.640028"`,
+			Resolution: "1080p",
+		},
+	}
+
+	cmd.SetOptionValue("video-res", "1080p")
+
+	videoURL, audioURL := getVideoByFormat(videoOnly, false)
+	if videoURL != "" || audioURL != "" {
+		t.Errorf("videoURL = %q, audioURL = %q, want both empty without an audio track",
+			videoURL, audioURL)
+	}
+}
+
+// RenewVideoURI reuses a resolved media URL until it expires, instead of
+// querying the API again on every playback.
+func TestRenewVideoURI_ReusesUnexpiredMediaURL(t *testing.T) {
+	initTestConfig(t)
+
+	var calls int
+
+	newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		fmt.Fprint(w, videoPayload)
+	})
+
+	video, err := getVideo(client.Ctx(), "YQHsXMglC9A")
+	if err != nil {
+		t.Fatalf("getVideo: %v", err)
+	}
+
+	future := time.Now().Add(time.Hour).Unix()
+	uri := [2]string{
+		"https://example.com/videoplayback?expire=" + strconv.FormatInt(future, 10) + "&itag=137",
+		"https://example.com/videoplayback?expire=" + strconv.FormatInt(future, 10) + "&itag=140",
+	}
+
+	calls = 0
+
+	got, gotURI, err := RenewVideoURI(client.Ctx(), uri, video, false)
+	if err != nil {
+		t.Fatalf("RenewVideoURI: %v", err)
+	}
+	if gotURI != uri {
+		t.Errorf("uris = %v, want the unexpired %v", gotURI, uri)
+	}
+	if calls != 0 {
+		t.Errorf("expected no API calls for an unexpired URL, got %d", calls)
+	}
+	if got.VideoID != video.VideoID {
+		t.Errorf("VideoID = %q, want %q", got.VideoID, video.VideoID)
+	}
+
+	t.Run("expired URLs are resolved again", func(t *testing.T) {
+		past := [2]string{
+			"https://example.com/videoplayback?expire=1000&itag=137",
+			"",
+		}
+
+		calls = 0
+
+		_, gotURI, err := RenewVideoURI(client.Ctx(), past, video, false)
+		if err != nil {
+			t.Fatalf("RenewVideoURI: %v", err)
+		}
+		if gotURI == past {
+			t.Errorf("uris = %v, want freshly resolved URIs", gotURI)
+		}
+		if gotURI[0] == "" {
+			t.Error("expected a resolved video URI")
+		}
+		// The formats are already present, so resolving them locally needs no
+		// further API round-trip.
+		if calls != 0 {
+			t.Errorf("expected no refetch when the formats are cached, got %d", calls)
+		}
+	})
+}
+
 func TestGetVideoByItag_UsesLatestVersionURL(t *testing.T) {
 	initTestConfig(t)
 
@@ -602,11 +832,10 @@ func TestLoopFormats_PicksAudioAndVideo(t *testing.T) {
 	})
 
 	t.Run("video breaks when first format's container has no video", func(t *testing.T) {
-		// ftype is taken from the FIRST adaptive format. If Invidious happens
-		// to order the webm/opus audio entry first and no webm video entry
-		// exists, ftype == "webm" and every mp4 video format is skipped, so
-		// getVideoURI fails with "No video URI". The result therefore depends
-		// on the order the API happens to emit.
+		// loopFormats is now only the fallback for instances that return no
+		// format URLs, and it is still order-dependent: ftype is taken from the
+		// FIRST adaptive format, so a leading webm/opus audio entry makes it
+		// skip every mp4 video format.
 		reordered := video
 		reordered.AdaptiveFormats = append(
 			[]VideoFormat{byItag(video, "251")},
@@ -625,11 +854,21 @@ func TestLoopFormats_PicksAudioAndVideo(t *testing.T) {
 			t.Errorf("expected no video URL, got %q", v)
 		}
 
-		_, _, err := getVideoURI(client.Ctx(), reordered, false)
-		if err == nil {
-			t.Error("expected \"No video URI\" error")
-		} else {
-			t.Logf("getVideoURI(video) -> %v", err)
+		// getVideoByFormat is not order-dependent: it ranks the mp4 video
+		// format regardless of where the webm audio entry sits, so the local
+		// resolution succeeds and the itag fallback is never reached.
+		cmd.SetOptionValue("video-res", "1080p")
+
+		videoURL, audioURL := getVideoByFormat(reordered, false)
+		if videoURL != "https://example.com/videoplayback?expire=1&itag=137" {
+			t.Errorf("getVideoByFormat videoURL = %q, want the itag 137 adaptive format", videoURL)
+		}
+		if audioURL != "https://example.com/videoplayback?expire=1&itag=140" {
+			t.Errorf("getVideoByFormat audioURL = %q, want the mp4 (itag 140) audio format", audioURL)
+		}
+
+		if _, _, err := getVideoURI(client.Ctx(), reordered, false); err != nil {
+			t.Errorf("getVideoURI(video) -> %v, want the locally resolved formats", err)
 		}
 	})
 }
