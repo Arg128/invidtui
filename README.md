@@ -16,6 +16,7 @@ Currently, it is tested on Linux and Windows, and it should work on MacOS.
 - Authentication with invidious and management of user feed, playlists and subscriptions
 - Download video and/or audio
 
+- PDTA : Only 'invidious.f5.si' is alvariable, working to 'bypass' other invidious instances
 ## Documentation
 Refer to the documentation [here](https://darkhz.github.io/invidtui/).
 
