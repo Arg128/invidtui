@@ -43,6 +43,7 @@ func (r *Resolver) setup() {
 }
 
 // DecodeJSONReader decodes JSON data from a Reader.
+//INVIDIOUS CONFIO EN QUE ME ENTREGAS UN JSON VALIDO
 func DecodeJSONReader(reader io.Reader, apply interface{}) error {
 	resolver.setup()
 

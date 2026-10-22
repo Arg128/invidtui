@@ -60,6 +60,32 @@ func (m *MPV) SendQuit(socket string) {
 	time.Sleep(1 * time.Second)
 }
 
+// LoadFallback loads a URL into MPV using replace mode, interrupting the current
+// playback and loading the fallback source (e.g., Invidious watch URL) as the
+// new active file. The audio flag controls the video track the same way
+// LoadFile does, so mpv + ytdl_hook fetches audio-only or audio+video as
+// required. This allows invidtui to maintain full control over playback.
+func (m *MPV) LoadFallback(url string, audio bool) error {
+	if url == "" {
+		return fmt.Errorf("MPV: Empty fallback URL")
+	}
+
+	if audio {
+		m.Call("set_property", "video", "no")
+	}
+
+	_, err := m.Call("loadfile", url, "replace", "-1")
+	if err != nil {
+		return fmt.Errorf("MPV: Unable to load fallback URL: %v", err)
+	}
+
+	if !audio {
+		m.Call("set_property", "video", "auto")
+	}
+
+	return nil
+}
+
 // LoadFile loads the provided files into MPV. When more than one file is provided,
 // the first file is treated as a video stream and the second file is attached as an audio stream.
 func (m *MPV) LoadFile(title string, duration int64, audio bool, files [2]string) error {
@@ -428,8 +454,7 @@ func (m *MPV) eventListener() {
 			if event.Reason == "eof" {
 				mediaEvent = EventEnd
 			}
-
-			if len(event.ExtraData) > 0 {
+			if len(event.ExtraData) > 0 {		// A veces los videos sin buen handshake pueden reproducir de forma adecuada
 				var errorText string
 
 				m.store(event.ExtraData["file_error"], &errorText)

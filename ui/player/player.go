@@ -908,6 +908,7 @@ func mediaEventHandler(event mp.MediaEvent) {
 	case mp.EventInProgress:
 		player.queue.MarkPlayingEntry(EntryPlaying)
 		player.queue.SetTimestamp(player.queue.Position())
+		player.queue.ResetFallbackTried(player.queue.Position())
 
 	case mp.EventLoading:
 		player.queue.MarkPlayingEntry(EntryLoading)
@@ -917,11 +918,7 @@ func mediaEventHandler(event mp.MediaEvent) {
 		player.queue.AutoPlay(false)
 
 	case mp.EventError:
-		if data, ok := player.queue.GetCurrent(); !ok {
-			app.ShowError(fmt.Errorf("Player: Unable to play %q", data.Reference.Title))
-		}
-
-		player.queue.AutoPlay(true)
+		player.queue.RetryWithFallback()
 	}
 }
 

@@ -10,6 +10,7 @@ type MediaPlayer interface {
 	SendQuit(socket string)
 
 	LoadFile(title string, duration int64, liveaudio bool, files [2]string) error
+	LoadFallback(url string, audio bool) error
 
 	Play()
 	Stop()

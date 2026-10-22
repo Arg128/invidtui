@@ -2,7 +2,7 @@ package client
 
 import (
 	"fmt"
-	"net/http"
+	// "net/http"
 	"net/url"
 	"strings"
 
@@ -54,11 +54,15 @@ func CheckInstance(host string) (string, error) {
 
 	SetHost(host)
 	host = FullHost()
+	
 
-	res, err := request(Ctx(), http.MethodHead, API+"search", nil)
-	if err == nil && res.StatusCode == 200 {
-		return host, nil
-	}
+	// Por lo visto esto verifica si tiene /search en la API habilitada, si lo tiene
+	// ahora podremos manejar la logica de fetcheo directamente desde otro BACKEND.
+	// res, err := request(Ctx(), http.MethodHead, API+"search", nil)
+	// if err == nil && res.StatusCode == 200 {
+	// 	return host, nil
+	// }
+	return host, nil
 
 	return "", fmt.Errorf("Client: Cannot select instance")
 }

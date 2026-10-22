@@ -24,6 +24,7 @@ import (
 	"github.com/gammazero/deque"
 	"github.com/gdamore/tcell/v2"
 	"golang.org/x/sync/semaphore"
+	"github.com/darkhz/invidtui/client"
 )
 
 // Queue describes the media queue.
@@ -62,6 +63,7 @@ type QueueData struct {
 	Reference                 inv.VideoData
 	Columns                   [QueueColumnSize]*tview.TableCell
 	Audio, Playing, HasPlayed bool
+	FallbackTried             bool
 	Timestamp                 *int64
 }
 
@@ -368,6 +370,8 @@ func (q *Queue) Play(norender ...struct{}) {
 			return
 		}
 
+		q.ResetFallbackTried(q.Position())
+
 		mp.Player().Stop()
 
 		q.MarkPlayingEntry(EntryFetching)
@@ -406,6 +410,56 @@ func (q *Queue) Play(norender ...struct{}) {
 			renderInfo(data.Reference, struct{}{})
 		}
 	}()
+}
+
+// ResetFallbackTried clears the fallback guard for the entry at position,
+// allowing a fresh error to try the MPV fallback once again.
+func (q *Queue) ResetFallbackTried(position int) {
+	q.storeMutex.Lock()
+	defer q.storeMutex.Unlock()
+
+	if ptr, ok := q.GetEntryPointer(position); ok {
+		ptr.FallbackTried = false
+	}
+}
+
+// RetryWithFallback reloads the current entry through the Player instance,
+// letting the controlled MPV + ytdl_hook resolve the watch URL directly as
+// audio or video as required. Only tried once per entry (FallbackTried).
+func (q *Queue) RetryWithFallback() {
+	data, ok := q.GetCurrent()
+	if !ok {
+		app.ShowError(fmt.Errorf("Player: Cannot get current entry data"))
+		return
+	}
+
+	if data.FallbackTried {
+		q.MarkPlayingEntry(EntryStopped)
+		q.AutoPlay(true)
+		return
+	}
+
+	q.storeMutex.Lock()
+	if ptr, ok := q.GetEntryPointer(q.Position()); ok {
+		ptr.FallbackTried = true
+	}
+	audio := data.Audio
+	q.storeMutex.Unlock()
+
+
+	instance := utils.GetHostname(client.FullHost())
+
+	uri := fmt.Sprintf("https://%[1]s/watch?v=%[2]s", "invidious.nerdvpn.de" ,data.Reference.VideoID)
+	q.MarkPlayingEntry(EntryLoading)
+
+	if err := mp.Player().LoadFallback(uri, audio); err != nil {
+		app.ShowError(fmt.Errorf("Player: Fallback failed: %v", err))
+		q.MarkPlayingEntry(EntryStopped)
+		q.AutoPlay(true)
+		return
+	}
+
+	mp.Player().Play()
 }
 
 // Delete removes a entry from the specified position within the queue.
