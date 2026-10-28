@@ -24,7 +24,8 @@ import (
 	"github.com/gammazero/deque"
 	"github.com/gdamore/tcell/v2"
 	"golang.org/x/sync/semaphore"
-	"github.com/darkhz/invidtui/client"
+
+	// "github.com/darkhz/invidtui/client"
 )
 
 // Queue describes the media queue.
@@ -447,9 +448,9 @@ func (q *Queue) RetryWithFallback() {
 	q.storeMutex.Unlock()
 
 
-	instance := utils.GetHostname(client.FullHost())
+	// instance := utils.GetHostname(client.FullHost())
 
-	uri := fmt.Sprintf("https://%[1]s/watch?v=%[2]s", "invidious.nerdvpn.de" ,data.Reference.VideoID)
+	uri := fmt.Sprintf("https://%[1]s/watch?v=%[2]s&local=true", "invidious.nerdvpn.de" ,data.Reference.VideoID)
 	q.MarkPlayingEntry(EntryLoading)
 
 	if err := mp.Player().LoadFallback(uri, audio); err != nil {
