@@ -89,6 +89,10 @@ func ShowInstancesList() {
 // checkInstance checks the instance.
 func checkInstance(instance string, table *tview.Table) {
 	if instance == utils.GetHostname(client.Instance()) {
+		if client.ClearRateLimits() {
+			app.ShowInfo("Rate limits cleared", false)
+		}
+
 		return
 	}
 

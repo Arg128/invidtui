@@ -24,3 +24,13 @@ The panic from --play-video is fixed. The initialization order change prevents n
 - mediaplayer/player.go — Interface updated to LoadFallback(url string,audio bool).
 - ui/player/queue.go — Added QueueData.FallbackTried; rewrote RetryWithFallback() to use mp.Player().LoadFallback+Play() with Loading mark and single-try guard; deleted exec.Command standalone mpv path and os/exec import; added ResetFallbackTried() cleared on Queue.Play() and EventInProgress.
 - ui/player/player.go — mediaEventHandler EventError now delegates to player.queue.RetryWithFallback(); EventInProgress resets guard.
+
+7. API key for invidious.nerdvpn.de and rate limit handling
+- client/apikey.go — API key sent as X-Invidious-Token only to https://invidious.nerdvpn.de, checked per request; header dropped on redirects leaving that host; errors mapped from the JSON "error" field: credentials_required ("API key was not received"), no key configured (access link), invalid_credentials ("API key rejected"), access_denied (shown with the server message); http:// for that host is refused.
+- client/proxy.go — loopback proxy (random port, secret path prefix) that forwards mpv media requests for that host, so mpv never sees the key; files of that host are loaded with ytdl=no so their URL never reaches youtube-dl; its last error is shown when playback fails, and playback stops instead of skipping on rate limits or refused keys.
+- client/ratelimit.go — on 429 (and 503 with Retry-After), honours Retry-After and holds back requests to the host that answered (a 503 holds for at most 10s); waits up to 10s (max 3 retries), otherwise returns "please try again in n seconds"; selecting the active instance again clears all holds.
+- client/instances.go, client/client.go — the instance list is fetched without switching the selected host, so tokens never go to api.invidious.io; request() reads the host under the lock; response bodies are closed on unexpected status codes; instance credentials also apply when the URL names the default port.
+- cmd/flags.go, cmd/cmd.go — new option api-key (config file or --api-key) and env var INVIDTUI_API_KEY; precedence flag > env > config.
+- mediaplayer/mpv.go — media URLs for that host are rewritten to the proxy before loadfile; the fallback watch URL is never proxied.
+- ui/player/queue.go — media URI and loadfile errors show their cause and stop the entry; fallback watch URL follows the selected instance (without credentials) instead of a hardcoded host; no fallback for invidious.nerdvpn.de.
+- cmd/config.go — --generate keeps an api-key from the config file, never one from env or flag.

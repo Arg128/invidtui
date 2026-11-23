@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/darkhz/invidtui/client"
 	inv "github.com/darkhz/invidtui/invidious"
 	mp "github.com/darkhz/invidtui/mediaplayer"
 	"github.com/darkhz/invidtui/ui/app"
@@ -24,8 +25,6 @@ import (
 	"github.com/gammazero/deque"
 	"github.com/gdamore/tcell/v2"
 	"golang.org/x/sync/semaphore"
-
-	// "github.com/darkhz/invidtui/client"
 )
 
 // Queue describes the media queue.
@@ -386,7 +385,7 @@ func (q *Queue) Play(norender ...struct{}) {
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				q.MarkPlayingEntry(EntryStopped)
-				app.ShowError(fmt.Errorf("Player: Cannot get media URI for %s", data.Reference.Title))
+				app.ShowError(fmt.Errorf("Player: Cannot get media URI for %s: %w", data.Reference.Title, err))
 			}
 
 			return
@@ -401,6 +400,7 @@ func (q *Queue) Play(norender ...struct{}) {
 			data.Audio,
 			uri,
 		); err != nil {
+			q.MarkPlayingEntry(EntryStopped)
 			app.ShowError(err)
 			return
 		}
@@ -425,8 +425,9 @@ func (q *Queue) ResetFallbackTried(position int) {
 }
 
 // RetryWithFallback reloads the current entry through the Player instance,
-// letting the controlled MPV + ytdl_hook resolve the watch URL directly as
-// audio or video as required. Only tried once per entry (FallbackTried).
+// letting MPV + ytdl_hook resolve the watch URL as audio or video as required.
+// Only tried once per entry. No fallback is tried without a selected instance
+// or on the API key host, whose URLs must never reach youtube-dl.
 func (q *Queue) RetryWithFallback() {
 	data, ok := q.GetCurrent()
 	if !ok {
@@ -447,10 +448,33 @@ func (q *Queue) RetryWithFallback() {
 	audio := data.Audio
 	q.storeMutex.Unlock()
 
+	instance := client.Host()
+	switch {
+	case instance == "":
+		app.ShowError(fmt.Errorf("Player: Fallback failed: no instance selected"))
+		q.MarkPlayingEntry(EntryStopped)
+		q.AutoPlay(true)
+		return
 
-	// instance := utils.GetHostname(client.FullHost())
+	case client.IsAPIKeyInstance():
+		err := fmt.Errorf("Player: Fallback is not available for %s", client.APIKeyHost)
+		proxyErr := client.TakeProxyError()
+		if proxyErr != nil {
+			err = fmt.Errorf("Player: %v", proxyErr)
+		}
 
-	uri := fmt.Sprintf("https://%[1]s/watch?v=%[2]s&local=true", "invidious.nerdvpn.de" ,data.Reference.VideoID)
+		app.ShowError(err)
+		q.MarkPlayingEntry(EntryStopped)
+
+		// Further entries would fail the same way, so playback stops here.
+		if !client.IsBlockingError(proxyErr) {
+			q.AutoPlay(true)
+		}
+
+		return
+	}
+
+	uri := instance + "/watch?v=" + url.QueryEscape(data.Reference.VideoID) + "&local=true"
 	q.MarkPlayingEntry(EntryLoading)
 
 	if err := mp.Player().LoadFallback(uri, audio); err != nil {

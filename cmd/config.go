@@ -17,6 +17,10 @@ import (
 type Config struct {
 	path, socket string
 
+	// fileAPIKey is the API key as read from the config file, before the
+	// environment and command-line overrides.
+	fileAPIKey string
+
 	mutex sync.Mutex
 
 	*koanf.Koanf
@@ -177,6 +181,10 @@ func generateConfig() {
 				genMap[option.Name] = config.Get(option.Name)
 			}
 		}
+	}
+
+	if config.fileAPIKey != "" {
+		genMap["api-key"] = config.fileAPIKey
 	}
 
 	RunAllGenerators(genMap)
