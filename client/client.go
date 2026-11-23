@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +55,7 @@ func Init() {
 				KeepAlive: 10 * time.Second,
 			}).DialContext,
 		},
+		CheckRedirect: checkRedirect,
 	}
 
 	client.rctx, client.rcancel = context.WithCancel(context.Background())
@@ -62,6 +64,9 @@ func Init() {
 
 // Host returns the client's host.
 func Host() string {
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+
 	if client.uri == nil {
 		return ""
 	}
@@ -87,16 +92,33 @@ func SetHost(host string) *url.URL {
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
 
-	client.uri, _ = url.Parse(host)
-	if client.uri.Scheme == "" {
-		client.uri.Scheme = "https"
-		client.uri, _ = url.Parse(client.uri.String())
+	uri, err := parseHost(host)
+	if err != nil {
+		client.uri, client.userinfo = nil, nil
+		return nil
 	}
 
+	client.uri = uri
 	client.userinfo = client.uri.User
 	client.uri.User = nil
 
 	return client.uri
+}
+
+// parseHost parses host and defaults its scheme to https.
+func parseHost(host string) (*url.URL, error) {
+	uri, err := url.Parse(host)
+	if err != nil {
+		return nil, fmt.Errorf("Client: Invalid URL")
+	}
+	if uri.Scheme == "" {
+		uri.Scheme = "https"
+		if uri, err = url.Parse(uri.String()); err != nil {
+			return nil, fmt.Errorf("Client: Invalid URL")
+		}
+	}
+
+	return uri, nil
 }
 
 // Get send a GET request to the host and returns a response
@@ -137,6 +159,7 @@ func Patch(ctx context.Context, param, body string, token ...string) (*http.Resp
 	}
 
 	if res.StatusCode != 204 {
+		res.Body.Close()
 		return nil, fmt.Errorf("HTTP request returned %d", res.StatusCode)
 	}
 
@@ -205,18 +228,43 @@ func SendCancel() {
 
 // request sends a HTTP request to the URL and returns a response.
 func request(ctx context.Context, method, param string, body io.Reader, token ...string) (*http.Response, error) {
-	if client.uri == nil {
+	host := Host()
+	if host == "" {
 		return nil, fmt.Errorf("Client: Not initialized")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, Host()+param, body)
+	req, err := newRequest(ctx, method, host+param, body, token...)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := doWithRateLimit(client.Client, req)
+	if err != nil {
+		return nil, netError(err)
+	}
+
+	if err := apiKeyResponseError(req, res); err != nil {
+		res.Body.Close()
+		return nil, err
+	}
+
+	return res, nil
+}
+
+// newRequest builds a request to target with the user agent, the instance
+// credentials, the user token and the API key where each one applies.
+func newRequest(ctx context.Context, method, target string, body io.Reader, token ...string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
 	if err != nil {
 		return nil, err
 	}
 
 	req.Header.Set("User-Agent", UserAgent)
 	client.mutex.Lock()
-	userinfo := client.userinfo
+	var userinfo *url.Userinfo
+	if client.uri != nil && sameHost(client.uri, req.URL) {
+		userinfo = client.userinfo
+	}
 	client.mutex.Unlock()
 	if userinfo != nil {
 		password, _ := userinfo.Password()
@@ -238,12 +286,11 @@ func request(ctx context.Context, method, param string, body io.Reader, token ..
 		}
 	}
 
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, netError(err)
+	if err := applyAPIKey(req); err != nil {
+		return nil, err
 	}
 
-	return res, nil
+	return req, nil
 }
 
 // checkStatusCode checks and returns an error if the codes don't match the response's status code.
@@ -267,10 +314,35 @@ func checkStatusCode(res *http.Response, codes ...int) (*http.Response, error) {
 			message += ": " + responseError.Error
 		}
 
+		res.Body.Close()
+
 		return nil, fmt.Errorf(message, res.StatusCode)
 	}
 
 	return res, nil
+}
+
+// sameHost reports whether a and b name the same host and port,
+// treating a missing port as the scheme's default.
+func sameHost(a, b *url.URL) bool {
+	return strings.EqualFold(a.Hostname(), b.Hostname()) && effectivePort(a) == effectivePort(b)
+}
+
+// effectivePort returns the port of u, or the default port of its scheme.
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+
+	switch u.Scheme {
+	case "https":
+		return "443"
+
+	case "http":
+		return "80"
+	}
+
+	return ""
 }
 
 // netError returns messages for common network errors.

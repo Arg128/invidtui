@@ -26,10 +26,19 @@ type Option struct {
 	Value, Type       string
 }
 
+// APIKeyEnv is the environment variable that holds the API key.
+const APIKeyEnv = "INVIDTUI_API_KEY"
+
 var options = []Option{
 	{
 		Name:        "token",
 		Description: "Specify an authorization token. Use with --force-instance.",
+		Value:       "",
+		Type:        "auth",
+	},
+	{
+		Name:        "api-key",
+		Description: "Specify the API key for " + client.APIKeyHost + ". Prefer the config file or " + APIKeyEnv + ".",
 		Value:       "",
 		Type:        "auth",
 	},
@@ -171,6 +180,7 @@ func parse() {
 
 			for _, name := range []string{
 				"token",
+				"api-key",
 				"token-link",
 				"search-video",
 				"search-channel",
@@ -217,6 +227,14 @@ func parse() {
 
 	if err := config.Load(file.Provider(configFile), hjson.Parser()); err != nil {
 		printer.Error(err.Error())
+	}
+
+	config.fileAPIKey = config.String("api-key")
+
+	if key := os.Getenv(APIKeyEnv); key != "" {
+		if err := config.Set("api-key", key); err != nil {
+			printer.Error(err.Error())
+		}
 	}
 
 	if err := config.Load(posflag.Provider(fs, ".", config.Koanf), nil); err != nil {
@@ -297,6 +315,9 @@ func checkAuth() {
 	printer.Print("Authenticating")
 
 	client.SetHost(normalized)
+	if err := client.RequireAPIKey(); err != nil {
+		printer.Error(err.Error())
+	}
 	if !client.IsTokenValid(token) {
 		printer.Error("Invalid token or authentication timeout")
 	}

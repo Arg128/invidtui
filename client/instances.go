@@ -2,7 +2,7 @@ package client
 
 import (
 	"fmt"
-	// "net/http"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -14,17 +14,24 @@ func Instance() string {
 	return Host()
 }
 
-// GetInstances returns a list of instances.
+// GetInstances returns a list of instances. It fetches InstanceData directly,
+// without changing the selected instance.
 func GetInstances() ([]string, error) {
 	var instances [][]interface{}
 	var list []string
 
-	host := FullHost()
-
-	dataURI := SetHost(InstanceData)
-
-	res, err := Get(Ctx(), fmt.Sprintf("%s?%s", dataURI.Path, dataURI.RawQuery))
+	req, err := newRequest(Ctx(), http.MethodGet, InstanceData, nil)
 	if err != nil {
+		return nil, err
+	}
+
+	res, err := doWithRateLimit(client.Client, req)
+	if err != nil {
+		return nil, netError(err)
+	}
+	defer res.Body.Close()
+
+	if _, err := checkStatusCode(res, http.StatusOK); err != nil {
 		return nil, err
 	}
 
@@ -41,8 +48,6 @@ func GetInstances() ([]string, error) {
 		}
 	}
 
-	SetHost(host)
-
 	return list, nil
 }
 
@@ -52,12 +57,20 @@ func CheckInstance(host string) (string, error) {
 		return "", fmt.Errorf("Client: Invalid URL")
 	}
 
-	SetHost(host)
-	host = FullHost()
-	
+	uri, err := parseHost(host)
+	if err != nil {
+		return "", err
+	}
+	if err := requireAPIKey(uri); err != nil {
+		return "", err
+	}
 
-	// Por lo visto esto verifica si tiene /search en la API habilitada, si lo tiene
-	// ahora podremos manejar la logica de fetcheo directamente desde otro BACKEND.
+	SetHost(host)
+	clearRateLimit(uri.Host)
+	host = FullHost()
+
+	// Checks whether the instance has the /search API enabled; if so, fetching
+	// can be handled directly by another backend.
 	// res, err := request(Ctx(), http.MethodHead, API+"search", nil)
 	// if err == nil && res.StatusCode == 200 {
 	// 	return host, nil

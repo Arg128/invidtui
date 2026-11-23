@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/darkhz/invidtui/client"
 	"github.com/darkhz/invidtui/resolver"
 	"github.com/darkhz/mpvipc"
 )
@@ -97,17 +98,31 @@ func (m *MPV) LoadFile(title string, duration int64, audio bool, files [2]string
 		m.Call("set_property", "video", "0")
 	}
 
+	client.TakeProxyError()
+
+	keyHost := false
+	for i := range files {
+		keyHost = keyHost || client.IsAPIKeyURL(files[i])
+		files[i] = client.ProxyURL(files[i])
+	}
+
 	options := []string{}
+
+	// URLs of the API key host must not reach the ytdl_hook, which would pass
+	// them to youtube-dl on the command line if loading fails.
+	if keyHost {
+		options = append(options, "ytdl=no")
+	}
 	if duration > 0 {
 		options = append(options, "length="+strconv.FormatInt(duration, 10))
 	}
-	if len(files) == 2 {
+	if files[1] != "" {
 		options = append(options, "audio-file="+files[1])
 	}
 
 	_, err := m.Call("loadfile", files[0], "replace", "-1", strings.Join(options, ","))
 	if err != nil {
-		return fmt.Errorf("MPV: Unable to load %s", title)
+		return fmt.Errorf("MPV: Unable to load %s: %v", title, err)
 	}
 
 	if !audio {

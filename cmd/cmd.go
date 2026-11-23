@@ -23,6 +23,7 @@ func Init() {
 	generate()
 
 	client.Init()
+	client.SetAPIKey(GetOptionValue("api-key"))
 	printInstances()
 
 	check()
